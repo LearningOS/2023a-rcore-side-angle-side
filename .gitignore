@@ -1,4 +1,4 @@
-*/*
+.*/*
 !.github/*
 !.vscode/settings.json
 .idea
@@ -17,4 +17,3 @@ pushall.sh
 *.bak
 
 user/*
-ci-user/*\
