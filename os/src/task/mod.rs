@@ -14,16 +14,19 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::loader::{get_app_data, get_num_app};
-use crate::sync::UPSafeCell;
-use crate::trap::TrapContext;
+use crate::{
+    config::{CLOCK_FREQ, MAX_SYSCALL_NUM},
+    loader::{get_app_data, get_num_app},
+    mm::{MapPermission, VPNRange, VirtAddr},
+    sync::UPSafeCell,
+    timer::{get_time, get_time_us},
+    trap::TrapContext,
+};
 use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
-use crate::syscall::process::TaskInfo;
-use crate::timer::get_time_ms;
 pub use context::TaskContext;
 
 /// The task manager, where all the tasks are managed.
@@ -39,15 +42,15 @@ pub struct TaskManager {
     /// total number of tasks
     num_app: usize,
     /// use inner value to get mutable access
-    pub(crate) inner: UPSafeCell<TaskManagerInner>,
+    inner: UPSafeCell<TaskManagerInner>,
 }
 
 /// The task manager inner in 'UPSafeCell'
-pub struct TaskManagerInner {
+struct TaskManagerInner {
     /// task list
-    pub(crate) tasks: Vec<TaskControlBlock>,
+    tasks: Vec<TaskControlBlock>,
     /// id of current `Running` task
-    pub(crate) current_task: usize,
+    current_task: usize,
 }
 
 lazy_static! {
@@ -81,8 +84,6 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let next_task = &mut inner.tasks[0];
         next_task.task_status = TaskStatus::Running;
-        next_task.is_already_running = true;
-        next_task.task_info.time = get_time_ms();
         let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
@@ -145,16 +146,12 @@ impl TaskManager {
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
             inner.current_task = next;
-
-            let task = &mut inner.tasks[next];
-
-            if !task.is_already_running {
-                task.is_already_running = true;
-                task.task_info.time = get_time_ms();
-            }
-
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
+            let next_task_start_time = &mut inner.tasks[next].start_time;
+            if next_task_start_time.is_none() {
+                *next_task_start_time = Some(get_time_us());
+            }
             drop(inner);
             // before this, we should drop local variables that must be dropped manually
             unsafe {
@@ -166,17 +163,77 @@ impl TaskManager {
         }
     }
 
-    fn count_syscall(&self, id: usize) {
+    fn count_syscall(&self, syscall_id: usize) {
         let mut inner = self.inner.exclusive_access();
         let current = inner.current_task;
-        let task = &mut inner.tasks[current];
-        task.task_info.syscall_times[id] += 1;
+        inner.tasks[current].syscall_times[syscall_id] += 1;
     }
 
-    fn task_info(&self) -> TaskInfo {
+    fn get_syscall_times(&self) -> [u32; MAX_SYSCALL_NUM] {
         let inner = self.inner.exclusive_access();
         let current = inner.current_task;
-        inner.tasks[current].task_info
+        inner.tasks[current].syscall_times
+    }
+
+    fn get_current_task_status(&self) -> TaskStatus {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].task_status
+    }
+
+    fn get_current_run_time(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let start_time = inner.tasks[current].start_time.unwrap();
+        (get_time() - start_time) / (CLOCK_FREQ / 1000)
+    }
+
+    fn mmap(&self, start: usize, len: usize, port: usize) -> isize {
+        let start_va: VirtAddr = start.into();
+        if !start_va.aligned() || port & !0x7 != 0 || port & 0x7 == 0 {
+            return -1;
+        }
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let tcb = &mut inner.tasks[current];
+        let start_vpn = start_va.floor();
+        let end_va: VirtAddr = (start_va.0 + len).into();
+        let end_vpn = end_va.ceil();
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if let Some(pte) = tcb.memory_set.translate(vpn) {
+                if pte.is_valid() {
+                    return -1;
+                }
+            }
+        }
+        let map_permission =
+            MapPermission::from_bits((port as u8) << 1).unwrap() | MapPermission::U;
+        tcb.memory_set
+            .insert_framed_area(start_va, end_va, map_permission);
+        0
+    }
+
+    fn munmap(&self, start: usize, len: usize) -> isize {
+        let start_va: VirtAddr = start.into();
+        if !start_va.aligned() {
+            return -1;
+        }
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let tcb = &mut inner.tasks[current];
+        let start_vpn = start_va.floor();
+        let end_va: VirtAddr = (start_va.0 + len).into();
+        let end_vpn = end_va.ceil();
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if let Some(pte) = tcb.memory_set.translate(vpn) {
+                if !pte.is_valid() {
+                    return -1;
+                }
+            } else {
+                return -1;
+            }
+        }
+        tcb.memory_set.remove_framed_area(start_va, end_va)
     }
 }
 
@@ -229,11 +286,31 @@ pub fn change_program_brk(size: i32) -> Option<usize> {
 }
 
 /// Count the number of syscalls
-pub fn count_syscall(id: usize) {
-    TASK_MANAGER.count_syscall(id)
+pub fn count_syscall(syscall_id: usize) {
+    TASK_MANAGER.count_syscall(syscall_id);
 }
 
-/// Get the current 'Running' task's task info.
-pub fn task_info() -> TaskInfo {
-    TASK_MANAGER.task_info()
+/// Get the number of syscalls
+pub fn get_syscall_times() -> [u32; MAX_SYSCALL_NUM] {
+    TASK_MANAGER.get_syscall_times()
+}
+
+/// Get the status of current task
+pub fn get_current_task_status() -> TaskStatus {
+    TASK_MANAGER.get_current_task_status()
+}
+
+/// Get the running time of current task
+pub fn get_current_run_time() -> usize {
+    TASK_MANAGER.get_current_run_time()
+}
+
+/// mmap
+pub fn mmap(start: usize, len: usize, port: usize) -> isize {
+    TASK_MANAGER.mmap(start, len, port)
+}
+
+/// munmap
+pub fn munmap(start: usize, len: usize) -> isize {
+    TASK_MANAGER.munmap(start, len)
 }

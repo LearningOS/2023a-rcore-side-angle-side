@@ -210,8 +210,8 @@ pub struct SimpleRange<T>
 where
     T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
 {
-    pub l: T,
-    pub r: T,
+    l: T,
+    r: T,
 }
 impl<T> SimpleRange<T>
 where
