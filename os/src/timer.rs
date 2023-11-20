@@ -9,7 +9,7 @@ const TICKS_PER_SEC: usize = 100;
 const MSEC_PER_SEC: usize = 1000;
 /// The number of microseconds per second
 #[allow(dead_code)]
-const MICRO_PER_SEC: usize = 1_000_000;
+pub const MICRO_PER_SEC: usize = 1_000_000;
 
 /// Get the current time in ticks
 pub fn get_time() -> usize {
