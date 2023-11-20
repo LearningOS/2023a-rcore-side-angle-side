@@ -2,6 +2,9 @@ use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::task::{block_current_and_run_next, current_process, current_task};
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
+
+const DEAD_LOCK: isize = -0xDEAD;
+
 /// sleep syscall
 pub fn sys_sleep(ms: usize) -> isize {
     trace!(
@@ -44,9 +47,7 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
     if let Some(id) = process_inner
         .mutex_list
         .iter()
-        .enumerate()
-        .find(|(_, item)| item.is_none())
-        .map(|(id, _)| id)
+        .position(|item| item.is_none())
     {
         process_inner.mutex_list[id] = mutex;
         id as isize
@@ -70,6 +71,9 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
     );
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
+    if process_inner.enable_deadlock_check && !process_inner.check_mutex(mutex_id) {
+        return DEAD_LOCK;
+    }
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
     drop(process_inner);
     drop(process);
@@ -115,9 +119,7 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
     let id = if let Some(id) = process_inner
         .semaphore_list
         .iter()
-        .enumerate()
-        .find(|(_, item)| item.is_none())
-        .map(|(id, _)| id)
+        .position(|item| item.is_none())
     {
         process_inner.semaphore_list[id] = Some(Arc::new(Semaphore::new(res_count)));
         id
@@ -164,6 +166,9 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
     );
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
+    if process_inner.enable_deadlock_check && !process_inner.check_semaphore(sem_id) {
+        return DEAD_LOCK;
+    }
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
     drop(process_inner);
     sem.down();
@@ -187,9 +192,7 @@ pub fn sys_condvar_create() -> isize {
     let id = if let Some(id) = process_inner
         .condvar_list
         .iter()
-        .enumerate()
-        .find(|(_, item)| item.is_none())
-        .map(|(id, _)| id)
+        .position(|item| item.is_none())
     {
         process_inner.condvar_list[id] = Some(Arc::new(Condvar::new()));
         id
@@ -242,10 +245,18 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
     condvar.wait(mutex);
     0
 }
-/// enable deadlock detection syscall
-///
-/// YOUR JOB: Implement deadlock detection, but might not all in this syscall
-pub fn sys_enable_deadlock_detect(_enabled: usize) -> isize {
-    trace!("kernel: sys_enable_deadlock_detect NOT IMPLEMENTED");
-    -1
+/// enable or disable deadlock detect syscall
+pub fn sys_enable_deadlock_detect(enabled: usize) -> isize {
+    trace!("kernel: sys_enable_deadlock_detect");
+    if enabled > 1 {
+        return -1;
+    }
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.enable_deadlock_check = match enabled {
+        0 => false,
+        1 => true,
+        _ => unreachable!(),
+    };
+    0
 }
