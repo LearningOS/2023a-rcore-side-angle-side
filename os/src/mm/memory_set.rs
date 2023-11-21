@@ -318,6 +318,24 @@ impl MemorySet {
             false
         }
     }
+
+    /// Remove a framed area which has the matching start/end virtual page number
+    ///
+    /// Return -1 if there is no such matching area.
+    pub fn remove_framed_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        if let Some(map_area) = self
+            .areas
+            .iter_mut()
+            .find(|a| a.vpn_range.get_start() == start_vpn && a.vpn_range.get_end() == end_vpn)
+        {
+            map_area.unmap(&mut self.page_table);
+            0
+        } else {
+            -1
+        }
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
